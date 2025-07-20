@@ -525,45 +525,137 @@
         // PDF Compression
         async function compressPDF() {
             const file = currentFiles.pdf;
-            const targetSize = parseInt(document.getElementById('pdf-target-size').value) * 1024;
+            const targetSizeKB = parseInt(document.getElementById('pdf-target-size').value);
+            const targetSize = targetSizeKB * 1024;
             const quality = parseFloat(document.getElementById('pdf-quality').value);
             
             setProgress('pdf-progress', 10);
             
             try {
                 const arrayBuffer = await file.arrayBuffer();
+                setProgress('pdf-progress', 20);
+                
+                // Load PDF with PDF.js first to render pages
+                pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+                const pdfDoc = await pdfjsLib.getDocument(arrayBuffer).promise;
+                const numPages = pdfDoc.numPages;
+                
                 setProgress('pdf-progress', 30);
                 
-                const pdfDoc = await PDFLib.PDFDocument.load(arrayBuffer);
-                setProgress('pdf-progress', 50);
+                // Create new PDF with jsPDF
+                const { jsPDF } = window.jspdf;
+                const pdf = new jsPDF();
                 
-                // Compress images in PDF
-                const pages = pdfDoc.getPages();
-                for (let i = 0; i < pages.length; i++) {
-                    // This is a simplified compression - in real scenario you'd need more complex image processing
-                    setProgress('pdf-progress', 50 + (i / pages.length) * 30);
+                // Remove the default page
+                pdf.deletePage(1);
+                
+                for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+                    const page = await pdfDoc.getPage(pageNum);
+                    
+                    // Calculate scale based on quality setting
+                    let scale = quality;
+                    if (quality === 0.3) scale = 0.5; // Low quality
+                    else if (quality === 0.6) scale = 0.8; // Medium quality  
+                    else scale = 1.2; // High quality
+                    
+                    const viewport = page.getViewport({ scale });
+                    
+                    const canvas = document.createElement('canvas');
+                    const context = canvas.getContext('2d');
+                    canvas.height = viewport.height;
+                    canvas.width = viewport.width;
+                    
+                    // Render page to canvas
+                    await page.render({
+                        canvasContext: context,
+                        viewport: viewport
+                    }).promise;
+                    
+                    // Convert canvas to image with compression
+                    const imgData = canvas.toDataURL('image/jpeg', quality);
+                    
+                    // Calculate dimensions to fit page
+                    const imgWidth = canvas.width;
+                    const imgHeight = canvas.height;
+                    const ratio = Math.min(210 / imgWidth, 297 / imgHeight); // A4 dimensions in mm
+                    
+                    const finalWidth = imgWidth * ratio;
+                    const finalHeight = imgHeight * ratio;
+                    
+                    // Add page and image
+                    pdf.addPage([finalWidth, finalHeight], 'portrait');
+                    pdf.addImage(imgData, 'JPEG', 0, 0, finalWidth, finalHeight);
+                    
+                    setProgress('pdf-progress', 30 + (pageNum / numPages) * 50);
                 }
                 
-                const pdfBytes = await pdfDoc.save({
-                    useObjectStreams: false,
-                    addDefaultPage: false
-                });
+                setProgress('pdf-progress', 85);
                 
-                setProgress('pdf-progress', 90);
+                // Try different compression levels if file is still too large
+                let pdfOutput = pdf.output('arraybuffer');
+                let currentQuality = quality;
+                let attempts = 0;
                 
-                const compressedSize = pdfBytes.byteLength;
+                while (pdfOutput.byteLength > targetSize && currentQuality > 0.1 && attempts < 5) {
+                    attempts++;
+                    currentQuality -= 0.15;
+                    
+                    // Recreate PDF with lower quality
+                    const newPdf = new jsPDF();
+                    newPdf.deletePage(1);
+                    
+                    for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+                        const page = await pdfDoc.getPage(pageNum);
+                        const viewport = page.getViewport({ scale: currentQuality });
+                        
+                        const canvas = document.createElement('canvas');
+                        const context = canvas.getContext('2d');
+                        canvas.height = viewport.height;
+                        canvas.width = viewport.width;
+                        
+                        await page.render({
+                            canvasContext: context,
+                            viewport: viewport
+                        }).promise;
+                        
+                        const imgData = canvas.toDataURL('image/jpeg', currentQuality);
+                        
+                        const imgWidth = canvas.width;
+                        const imgHeight = canvas.height;
+                        const ratio = Math.min(210 / imgWidth, 297 / imgHeight);
+                        
+                        const finalWidth = imgWidth * ratio;
+                        const finalHeight = imgHeight * ratio;
+                        
+                        newPdf.addPage([finalWidth, finalHeight], 'portrait');
+                        newPdf.addImage(imgData, 'JPEG', 0, 0, finalWidth, finalHeight);
+                    }
+                    
+                    pdfOutput = newPdf.output('arraybuffer');
+                    pdf = newPdf;
+                }
+                
+                setProgress('pdf-progress', 95);
+                
+                const compressedSize = pdfOutput.byteLength;
                 const reduction = Math.round(((file.size - compressedSize) / file.size) * 100);
                 
                 document.getElementById('pdf-compressed-size').textContent = formatFileSize(compressedSize);
-                document.getElementById('pdf-reduction').textContent = reduction + '%';
+                document.getElementById('pdf-reduction').textContent = Math.max(0, reduction) + '%';
                 
-                const blob = new Blob([pdfBytes], { type: 'application/pdf' });
-                setupDownload('download-pdf-btn', blob, 'compressed.pdf');
+                const blob = new Blob([pdfOutput], { type: 'application/pdf' });
+                setupDownload('download-pdf-btn', blob, `compressed_${file.name}`);
                 
                 document.getElementById('pdf-result').classList.add('show');
                 setProgress('pdf-progress', 100);
                 
+                // Show warning if target size wasn't reached
+                if (compressedSize > targetSize) {
+                    alert(`Note: Target size of ${targetSizeKB}KB could not be reached. Final size: ${Math.round(compressedSize/1024)}KB. Try lowering the quality setting for smaller files.`);
+                }
+                
             } catch (error) {
+                console.error('PDF compression error:', error);
                 alert('Error compressing PDF: ' + error.message);
                 setProgress('pdf-progress', 0);
             }
